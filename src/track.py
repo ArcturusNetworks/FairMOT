@@ -82,62 +82,41 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
         mkdir_if_missing(save_dir)
     tracker = JDETracker(opt, frame_rate=frame_rate)
     print("Created JDETracker model")
-    # added by Thinula
+    
+    # Setup outgoing stream
     context = zmq.Context()
     context.linger = 0
     repSocket = context.socket(zmq.ROUTER)
-    #repSocket.setsockopt(zmq.ROUTING_ID, b'Center Net')
-    #repSocket.setsockopt(zmq.RCVTIMEO, 5000)
     repSocket.bind("tcp://*:5558")
-    #repSocket.connect("tcp://127.0.0.1:5558")
     print("Binding to the outgoing port at tcp://*:5558")
-    #repSocket.send(b"Connect")
-    #print("Sent: Connect")
-    #streamId = b"AnalyticsDetections"
+
+    # Hardcoded out stream id (temporary)
     streamId = b"SinkDetections"
+
     while True:
         try:
+            print("Waiting for incoming stream connection...")
             data = repSocket.recv()
             buf = bytearray(data)
-            if buf == b"Waiting for Accepted":#b"Connect":
-                print(f"Received: {buf}")
-                if streamId is not None:
-                    print("Sending streamId")
-                    repSocket.send(streamId)
+            print(f"Received: {buf}")
+            if buf == b"Connect":
+                print("Ready to connect, sending streamId")
+                repSocket.send(streamId, zmq.SNDMORE)
+                print("Sending accepted")
                 repSocket.send(b"Accepted")
+                print("Exiting while loop!")
                 break
-            else:
-                #streamId = buf
-                print("Outputting received data...")
-                print(f"Received: {buf}")
-                if buf == b"Connect":
-                    print("Ready to connect, sending streamId")
-                    repSocket.send(streamId, zmq.SNDMORE)
-                    print("Sending accepted")
-                    repSocket.send(b"Accepted")
-                    print("Exiting while loop!")
-                    break
         except Exception as e:
             if str(e) == "Resource temporarily unavailable":
                 print("Receive timed out, reconnecting...")
             else:
                 print(e)
                 sys.exit(0)
-    
-    print("Sent Accepted Message")
-    #print("Receiving Data")
-    #data = repSocket.recv()
-    #buf = bytearray(data)
-    #if buf == b"Accepted":
-    #    print(f"Received: {buf}")
-    #else:
-    #    print(f"Receive Failed. Received this instead: {buf}")
 
-    print("Connected to port 5558!")
     timer = Timer()
     results = []
     frame_id = 0
-    print("Starting the for loop..")
+    print("Executing CenterNet..")
     #for path, img, img0 in dataloader:
     for i, (path, fbData, img, img0) in enumerate(dataloader):
         #if i % 8 != 0:
@@ -159,7 +138,7 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
         #online_scores = []
 
         
-        # Added by Thinula to send trackings to port 5558
+        # Decode flatbuffer data
         sp_frame_id = fbData.Id()
         timestamp = fbData.Timestamp().decode("utf-8")
         frame_data = fbData.Mat().DataAsNumpy().tobytes()
@@ -168,7 +147,7 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
         num_tracks = 0
         builder = flatbuffers.Builder(0) # Size will grow automatically if needed
         Frame.FrameStart(builder)
-        # might need to be careful about this next line for Bytes array going out of bounds? -Thinula
+
         builder.Bytes[builder.head : (builder.head + len(frame_data))] = frame_data
         fData = builder.EndVector(len(frame_data))
 
@@ -176,7 +155,6 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
         for t in online_targets:
             tlwh = t.tlwh
             tid = t.track_id
-            # added by Thinula
             conf = t.score
             vertical = tlwh[2] / tlwh[3] > 1.6
             if tlwh[2] * tlwh[3] > opt.min_box_area and not vertical:
@@ -184,7 +162,6 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
                 online_ids.append(tid)
                 #online_scores.append(t.score)
                 
-                # following lines added by Thinula
                 # tlwh: (top left x, top left y, width, height)
                 Box.BoxStart(builder)
                 print("Box parameters: ", tlwh)
@@ -202,25 +179,21 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
                 label = builder.CreateString(str("person"))
                 Detection.DetectionStart(builder)
                 Detection.DetectionAddId(builder, tid)
-                #Detection.DetectionAddLabel(builder, label)
-                #Detection.DetectionAddBbox(builder, box)
                 Detection.DetectionAddConf(builder, conf)
                 Detection.DetectionAddLabel(builder, label)
                 Detection.DetectionAddBbox(builder, box)
-                # needs label of tracking which might not be returned from CenterNet? -Thinula
 
                 obj_vec.append(Detection.DetectionEnd(builder))
                 num_tracks += 1
 
         
-        # build objects last, added by Thinula
+        # Build objects vector
         Detections.DetectionsStartDataVector(builder, num_tracks)
         for i in range(num_tracks):
             builder.PrependUOffsetTRelative(obj_vec[i])
         objects = builder.EndVector(num_tracks)
 
         timestamp_out = builder.CreateString(timestamp)
-        #print("Length of Data Being Added: ", len(fData))
         Detections.DetectionsStart(builder)
         Detections.DetectionsAddId(builder, sp_frame_id)
         Detections.DetectionsAddTimestamp(builder, timestamp_out)
@@ -232,8 +205,7 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
         fbData = Detections.Detections.GetRootAsDetections(buf, 0)
         sp_frame_id = fbData.Id()
         print("Frame ID: ", sp_frame_id)
-        #tstamp = fbData.Timestamp().decode("utf-8")
-        #print("Timestamp: ", tstamp)
+
         numObjects = fbData.DataLength()
         print("Number of Objects: ", numObjects)
         for boxNum in range(numObjects):
@@ -248,23 +220,15 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
             print("Confidence: ", obj_data.Conf())
             print("Tracking ID: ", obj_data.Id())
 
-        
-
-        # now send the flatbuffer to the output node via zmq
+        # Send data via outgoing zmq connection
         while True:
             try:
-                #repSocket.send(b"Accepted") #Hello")
                 print("Waiting to receive request from analytics filter")
                 replyData = repSocket.recv()
                 reply = bytearray(replyData)
-                # Not needed but for now make it enter 'if' statement
-                #reply = b"Request" #bytearray(data)
-                #print(f"Received: {reply}")
+
                 if reply == b"Request" or reply == b"":
-                    #print("Received the following reply from 5558: {bytearray(reply)}")
-                    #if streamId is None:
-                        #repSocket.send(streamId)
-                    print("Sending streamId...")
+                    print("Request received, sending streamId...")
                     repSocket.send(streamId, zmq.SNDMORE)
                     print("Sending tracking data...")
                     repSocket.send(buf)
