@@ -19,6 +19,14 @@ from opts import opts
 from utils.image import gaussian_radius, draw_umich_gaussian, draw_msra_gaussian
 from utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 
+import sys
+print(sys.path)
+
+import zmq
+import flatbuffers
+from datasets.dataset.fb_schemas import streamproc
+from datasets.dataset.fb_schemas.streamproc.models.fbs import Frame
+from datasets.dataset.fb_schemas.streamproc.models.fbs import Mat
 
 class LoadImages:  # for inference
     def __init__(self, path, img_size=(1088, 608)):
@@ -84,18 +92,34 @@ class LoadImages:  # for inference
 
 
 class LoadVideo:  # for inference
-    def __init__(self, path, img_size=(1088, 608)):
+    def __init__(self, path, img_size=(720, 576)):
+        
         self.cap = cv2.VideoCapture(path)
         self.frame_rate = int(round(self.cap.get(cv2.CAP_PROP_FPS)))
         self.vw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.vh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.vn = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.vn = 3500 # int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) 
 
         self.width = img_size[0]
         self.height = img_size[1]
         self.count = 0
-
-        self.w, self.h = 1920, 1080
+        
+        reqContext = zmq.Context()
+        #reqContext.linger = 0
+        self.reqSocket = reqContext.socket(zmq.DEALER)
+        self.reqSocket.setsockopt(zmq.ROUTING_ID, b"Center Net")
+        self.reqSocket.setsockopt(zmq.RCVTIMEO, 5000)
+        print("Connecting to port 5555")
+        #self.reqSocket.connect
+        self.reqSocket.connect("tcp://127.0.0.1:5555")
+        self.reqSocket.send(b"Connect")
+        #print("Receiving data")
+        #data = self.reqSocket.recv()
+        #buf = bytearray(data)
+        #if buf == b"Accepted":
+            #print(f'Received: {buf} ')
+        
+        self.w, self.h = 720, 576
         print('Lenth of the video: {:d} frames'.format(self.vn))
 
     def get_size(self, vw, vh, dw, dh):
@@ -112,10 +136,36 @@ class LoadVideo:  # for inference
         if self.count == len(self):
             raise StopIteration
         # Read image
-        res, img0 = self.cap.read()  # BGR
-        assert img0 is not None, 'Failed to load frame {:d}'.format(self.count)
-        img0 = cv2.resize(img0, (self.w, self.h))
+        #res, img0 = self.cap.read()  # BGR
+        #assert img0 is not None, 'Failed to load frame {:d}'.format(self.count)
+        fbData = None
+        img0 = None
+        try:
+            self.reqSocket.send(b"Request")
+            print("Sent request to 5555, waiting to receive frames")
+            data = self.reqSocket.recv()
+            print("Received frame")
+            buf = bytearray(data)
+            fbData = Frame.Frame.GetRootAsFrame(buf, 0)
+            print("Converted received data to frame object.")
+            mat = fbData.Mat()
+            frame_data = mat.DataAsNumpy()
+            img0 = frame_data.reshape((mat.Rows(), mat.Cols(), 3))
+            frame_id = fbData.Id()
+            tstamp = fbData.Timestamp().decode("utf-8")
+            print(f'frame_id: {frame_id}, tstamp: {tstamp}, image shape: {img0.shape}, image type: {type(img0)}')
 
+        except Exception as e:
+            if str(e) == "Resource temporarily unavailable":
+                print("Error: Receive timed out, reconnecting...")
+            else:
+                print("Error: ", e)
+
+        if img0 is None:
+            return None, None, None, None
+
+        #img0 = cv2.resize(img0, (self.w, self.h))
+        
         # Padded resize
         img, _, _, _ = letterbox(img0, height=self.height, width=self.width)
 
@@ -125,7 +175,7 @@ class LoadVideo:  # for inference
         img /= 255.0
 
         # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
-        return self.count, img, img0
+        return self.count, fbData, img, img0
 
     def __len__(self):
         return self.vn  # number of files
@@ -326,24 +376,6 @@ def random_affine(img, targets=None, degrees=(-10, 10), translate=(.1, .1), scal
         return imw, targets, M
     else:
         return imw
-
-
-def collate_fn(batch):
-    imgs, labels, paths, sizes = zip(*batch)
-    batch_size = len(labels)
-    imgs = torch.stack(imgs, 0)
-    max_box_len = max([l.shape[0] for l in labels])
-    labels = [torch.from_numpy(l) for l in labels]
-    filled_labels = torch.zeros(batch_size, max_box_len, 6)
-    labels_len = torch.zeros(batch_size)
-
-    for i in range(batch_size):
-        isize = labels[i].shape[0]
-        if len(labels[i]) > 0:
-            filled_labels[i, :isize, :] = labels[i]
-        labels_len[i] = isize
-
-    return imgs, filled_labels, paths, sizes, labels_len.unsqueeze(1)
 
 
 class JointDataset(LoadImagesAndLabels):  # for training

@@ -23,6 +23,16 @@ from tracking_utils.utils import mkdir_if_missing
 from opts import opts
 
 
+# added by Thinula
+import zmq
+import flatbuffers
+from datasets.dataset.fb_schemas.streamproc.models.fbs import Frame
+from datasets.dataset.fb_schemas.streamproc.models.fbs import Mat
+from datasets.dataset.fb_schemas.streamproc.models.fbs import Box
+from datasets.dataset.fb_schemas.streamproc.models.fbs import Detection
+from datasets.dataset.fb_schemas.streamproc.models.fbs import Detections
+
+
 def write_results(filename, results, data_type):
     if data_type == 'mot':
         save_format = '{frame},{id},{x1},{y1},{w},{h},1,-1,-1,-1\n'
@@ -67,15 +77,69 @@ def write_results_score(filename, results, data_type):
     logger.info('save results to {}'.format(filename))
 
 
-def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_image=True, frame_rate=30, use_cuda=True):
+def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_image=True, frame_rate=30):
     if save_dir:
         mkdir_if_missing(save_dir)
     tracker = JDETracker(opt, frame_rate=frame_rate)
+    print("Created JDETracker model")
+    # added by Thinula
+    context = zmq.Context()
+    context.linger = 0
+    repSocket = context.socket(zmq.ROUTER)
+    #repSocket.setsockopt(zmq.ROUTING_ID, b'Center Net')
+    #repSocket.setsockopt(zmq.RCVTIMEO, 5000)
+    repSocket.bind("tcp://*:5558")
+    #repSocket.connect("tcp://127.0.0.1:5558")
+    print("Binding to the outgoing port at tcp://*:5558")
+    #repSocket.send(b"Connect")
+    #print("Sent: Connect")
+    #streamId = b"AnalyticsDetections"
+    streamId = b"SinkDetections"
+    while True:
+        try:
+            data = repSocket.recv()
+            buf = bytearray(data)
+            if buf == b"Waiting for Accepted":#b"Connect":
+                print(f"Received: {buf}")
+                if streamId is not None:
+                    print("Sending streamId")
+                    repSocket.send(streamId)
+                repSocket.send(b"Accepted")
+                break
+            else:
+                #streamId = buf
+                print("Outputting received data...")
+                print(f"Received: {buf}")
+                if buf == b"Connect":
+                    print("Ready to connect, sending streamId")
+                    repSocket.send(streamId, zmq.SNDMORE)
+                    print("Sending accepted")
+                    repSocket.send(b"Accepted")
+                    print("Exiting while loop!")
+                    break
+        except Exception as e:
+            if str(e) == "Resource temporarily unavailable":
+                print("Receive timed out, reconnecting...")
+            else:
+                print(e)
+                sys.exit(0)
+    
+    print("Sent Accepted Message")
+    #print("Receiving Data")
+    #data = repSocket.recv()
+    #buf = bytearray(data)
+    #if buf == b"Accepted":
+    #    print(f"Received: {buf}")
+    #else:
+    #    print(f"Receive Failed. Received this instead: {buf}")
+
+    print("Connected to port 5558!")
     timer = Timer()
     results = []
     frame_id = 0
+    print("Starting the for loop..")
     #for path, img, img0 in dataloader:
-    for i, (path, img, img0) in enumerate(dataloader):
+    for i, (path, fbData, img, img0) in enumerate(dataloader):
         #if i % 8 != 0:
             #continue
         if frame_id % 20 == 0:
@@ -83,22 +147,143 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
 
         # run tracking
         timer.tic()
-        if use_cuda:
-            blob = torch.from_numpy(img).cuda().unsqueeze(0)
-        else:
-            blob = torch.from_numpy(img).unsqueeze(0)
+        # added by Thinula, this will happen when a frame is not read in from port 5555
+        if img is None:
+            frame_id += 1
+            continue
+        
+        blob = torch.from_numpy(img).cuda().unsqueeze(0)
         online_targets = tracker.update(blob, img0)
         online_tlwhs = []
         online_ids = []
         #online_scores = []
+
+        
+        # Added by Thinula to send trackings to port 5558
+        sp_frame_id = fbData.Id()
+        timestamp = fbData.Timestamp().decode("utf-8")
+        frame_data = fbData.Mat().DataAsNumpy().tobytes()
+        
+        obj_vec = []
+        num_tracks = 0
+        builder = flatbuffers.Builder(0) # Size will grow automatically if needed
+        Frame.FrameStart(builder)
+        # might need to be careful about this next line for Bytes array going out of bounds? -Thinula
+        builder.Bytes[builder.head : (builder.head + len(frame_data))] = frame_data
+        fData = builder.EndVector(len(frame_data))
+
+        
         for t in online_targets:
             tlwh = t.tlwh
             tid = t.track_id
+            # added by Thinula
+            conf = t.score
             vertical = tlwh[2] / tlwh[3] > 1.6
             if tlwh[2] * tlwh[3] > opt.min_box_area and not vertical:
                 online_tlwhs.append(tlwh)
                 online_ids.append(tid)
                 #online_scores.append(t.score)
+                
+                # following lines added by Thinula
+                # tlwh: (top left x, top left y, width, height)
+                Box.BoxStart(builder)
+                print("Box parameters: ", tlwh)
+                print("Confidence: ", conf)
+                print("Tracking ID: ", tid)
+                # need to convert tlwh elements to ints to pass into Box
+                xCoord, yCoord = int(tlwh[0]), int(tlwh[1])
+                width, height = int(tlwh[2]) + 1, int(tlwh[3]) + 1
+                Box.BoxAddX(builder, xCoord)
+                Box.BoxAddY(builder, yCoord)
+                Box.BoxAddWidth(builder, width)
+                Box.BoxAddHeight(builder, height)
+                box = Box.BoxEnd(builder)
+
+                label = builder.CreateString(str("person"))
+                Detection.DetectionStart(builder)
+                Detection.DetectionAddId(builder, tid)
+                #Detection.DetectionAddLabel(builder, label)
+                #Detection.DetectionAddBbox(builder, box)
+                Detection.DetectionAddConf(builder, conf)
+                Detection.DetectionAddLabel(builder, label)
+                Detection.DetectionAddBbox(builder, box)
+                # needs label of tracking which might not be returned from CenterNet? -Thinula
+
+                obj_vec.append(Detection.DetectionEnd(builder))
+                num_tracks += 1
+
+        
+        # build objects last, added by Thinula
+        Detections.DetectionsStartDataVector(builder, num_tracks)
+        for i in range(num_tracks):
+            builder.PrependUOffsetTRelative(obj_vec[i])
+        objects = builder.EndVector(num_tracks)
+
+        timestamp_out = builder.CreateString(timestamp)
+        #print("Length of Data Being Added: ", len(fData))
+        Detections.DetectionsStart(builder)
+        Detections.DetectionsAddId(builder, sp_frame_id)
+        Detections.DetectionsAddTimestamp(builder, timestamp_out)
+        Detections.DetectionsAddData(builder, objects) #fData)
+        finalBuffer = Detections.DetectionsEnd(builder)
+        builder.Finish(finalBuffer)
+        buf = builder.Output()
+        
+        fbData = Detections.Detections.GetRootAsDetections(buf, 0)
+        sp_frame_id = fbData.Id()
+        print("Frame ID: ", sp_frame_id)
+        #tstamp = fbData.Timestamp().decode("utf-8")
+        #print("Timestamp: ", tstamp)
+        numObjects = fbData.DataLength()
+        print("Number of Objects: ", numObjects)
+        for boxNum in range(numObjects):
+            obj_data = fbData.Data(boxNum)
+            bbox = obj_data.Bbox()
+            x = bbox.X()
+            y = bbox.Y()
+            width = bbox.Width()
+            height = bbox.Height()
+            box_params = [x, y, width, height]
+            print("Bounding box: ", box_params)
+            print("Confidence: ", obj_data.Conf())
+            print("Tracking ID: ", obj_data.Id())
+
+        
+
+        # now send the flatbuffer to the output node via zmq
+        while True:
+            try:
+                #repSocket.send(b"Accepted") #Hello")
+                print("Waiting to receive request from analytics filter")
+                replyData = repSocket.recv()
+                reply = bytearray(replyData)
+                # Not needed but for now make it enter 'if' statement
+                #reply = b"Request" #bytearray(data)
+                #print(f"Received: {reply}")
+                if reply == b"Request" or reply == b"":
+                    #print("Received the following reply from 5558: {bytearray(reply)}")
+                    #if streamId is None:
+                        #repSocket.send(streamId)
+                    print("Sending streamId...")
+                    repSocket.send(streamId, zmq.SNDMORE)
+                    print("Sending tracking data...")
+                    repSocket.send(buf)
+                    print("Sent tracking data to port 5558")
+                    break
+                elif reply == b"Connect":
+                    print("Received a connect request, reconnecting")
+                    repSocket.send(streamId, zmq.SNDMORE)
+                    repSocket.send(b"Accepted")
+                    print("Complete, accepted sent")
+                else:
+                    print(f"Received: {reply}")
+            except Exception as e:
+                if str(e) == "Resource temporarily unavailable":
+                    print("Receive timed out, reconnecting...")
+                else:
+                    print(e)
+                    sys.exit(0)
+
         timer.toc()
         # save results
         results.append((frame_id + 1, online_tlwhs, online_ids))
@@ -222,6 +407,14 @@ if __name__ == '__main__':
                       MOT17-08-SDP
                       MOT17-12-SDP
                       MOT17-14-SDP'''
+        #seqs_str = '''MOT17-01-SDP
+                      #MOT17-06-SDP
+                      #MOT17-07-SDP
+                      #MOT17-12-SDP
+                      #'''
+        #seqs_str = '''MOT17-01-SDP MOT17-07-SDP MOT17-12-SDP MOT17-14-SDP'''
+        #seqs_str = '''MOT17-03-SDP'''
+        #seqs_str = '''MOT17-06-SDP MOT17-08-SDP'''
         data_root = os.path.join(opt.data_dir, 'MOT17/images/test')
     if opt.val_mot17:
         seqs_str = '''MOT17-02-SDP
@@ -231,6 +424,7 @@ if __name__ == '__main__':
                       MOT17-10-SDP
                       MOT17-11-SDP
                       MOT17-13-SDP'''
+        #seqs_str = '''MOT17-02-SDP'''
         data_root = os.path.join(opt.data_dir, 'MOT17/images/train')
     if opt.val_mot15:
         seqs_str = '''Venice-2
@@ -245,6 +439,7 @@ if __name__ == '__main__':
                       ADL-Rundle-8
                       ETH-Pedcross2
                       TUD-Stadtmitte'''
+        #seqs_str = '''Venice-2'''
         data_root = os.path.join(opt.data_dir, 'MOT15/images/train')
     if opt.val_mot20:
         seqs_str = '''MOT20-01
