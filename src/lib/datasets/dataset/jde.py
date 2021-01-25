@@ -110,14 +110,8 @@ class LoadVideo:  # for inference
         self.reqSocket.setsockopt(zmq.ROUTING_ID, b"Center Net")
         self.reqSocket.setsockopt(zmq.RCVTIMEO, 5000)
         print("Connecting to port 5555")
-        #self.reqSocket.connect
         self.reqSocket.connect("tcp://127.0.0.1:5555")
         self.reqSocket.send(b"Connect")
-        #print("Receiving data")
-        #data = self.reqSocket.recv()
-        #buf = bytearray(data)
-        #if buf == b"Accepted":
-            #print(f'Received: {buf} ')
         
         self.w, self.h = 720, 576
         print('Lenth of the video: {:d} frames'.format(self.vn))
