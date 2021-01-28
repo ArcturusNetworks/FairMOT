@@ -90,6 +90,65 @@ class LoadImages:  # for inference
     def __len__(self):
         return self.nF  # number of files
 
+class LoadExecutor: # for inference on incoming frames
+    def __init__(self, port, img_size=(720,576)):
+        self.port = port
+        self.width = img_size[0]
+        self.height = img_size[1]
+
+        # Initialize zmq dealer for receiving frames
+        dealer_addr = b"tcp://127.0.0.1:" + bytearray(port)
+
+        inContext = zmq.Context()
+        #reqContext.linger = 0
+        self.inStream = inContext.socket(zmq.DEALER)
+        self.inStream.setsockopt(zmq.ROUTING_ID, b"Center Net")
+        #self.reqSocket.setsockopt(zmq.RCVTIMEO, 5000)
+        print(f"Incoming stream connecting to {dealer_addr}...")
+        #self.reqSocket.connect("tcp://127.0.0.1:5555")
+        self.inStream.connect(dealer_addr)
+        self.inStream.send(b"Connect")
+        # print("Successfully connected.")
+
+    def __next__(self):
+        fbData = None
+        imgCPU = None
+        try:
+            print("Requesting frame from port {}...", self.port)
+            self.inStream.send(b"Request")
+            data = self.inStream.recv()
+            print("Data received, decoding...")
+            buf = bytearray(data)
+            fbData = Frame.Frame.GetRootAsFrame(buf, 0)
+            # mat = fbData.Mat()
+            frameData = fbData.Mat().DataAsNumpy()
+            imgCPU = frameData.reshape((mat.Rows(), mat.Cols(), 3))
+            frameId = fbData.Id()
+            frameTs = fbData.Timestamp().decode("utf-8")
+            print(f'FRAME: {frameId}, TIME: {frameTs}, SHAPE: {imgCPU.shape}')
+        except Exception as e:
+            if str(e) == "Resource temporarily unavailable":
+                print("Error: Receive timed out, reconnecting...")
+            else:
+                print("Error: ", e)
+
+        # Should never be None
+        if imgCPU is None:
+            return None, None, None, None
+
+        #img0 = cv2.resize(img0, (self.w, self.h))
+        
+        # Padded resize
+        imgGPU, _, _, _ = letterbox(imgCPU, height=self.height, width=self.width)
+
+        # Normalize RGB
+        imgGPU = imgGPU[:, :, ::-1].transpose(2, 0, 1)
+        imgGPU = np.ascontiguousarray(imgGPU, dtype=np.float32)
+        imgGPU /= 255.0
+
+        return frameId, frameTs, imgGPU, imgCPU
+
+
 
 class LoadVideo:  # for inference
     def __init__(self, path, img_size=(720, 576)):

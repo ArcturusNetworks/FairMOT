@@ -76,6 +76,147 @@ def write_results_score(filename, results, data_type):
                 f.write(line)
     logger.info('save results to {}'.format(filename))
 
+def exec_frame(opt, executor):
+    # Run centernet on single frame and send to outgoing stream
+    # tracker = JDETracker(opt, frame_rate=frame_rate)
+    print("initializing JDE Tracker...")
+    # frame rate can be passed as an argument here, need to find out what it is
+    # used for...default is 30
+    tracker = JDETracker(opt)
+    print("Complete.")
+    
+    # Initialize zmq router for sending outgoing data
+    router_addr = b"tcp://*:" + bytearray(opt.out_port)
+    streamId = b"SinkDetections" # hardcoded out stream id (temporary)
+
+    outContext = zmq.Context()
+    outContext.linger = 0
+    outStream = outContext.socket(zmq.ROUTER)
+    # outStream.bind("tcp://*:5558")
+    print(f"Outgoing stream binding to {router_addr}...")
+    outStream.bind(router_addr)
+
+    while True:
+        try:
+            print("Outgoing stream waiting for connection request...")
+            data = outStream.recv()
+            buf = bytearray(data)
+            print(f"Received: {buf}")
+            if buf == b"Connect":
+                outStream.send(streamId, zmq.SNDMORE)
+                outStream.send(b"Accepted")
+                print("Outgoing stream connection request accepted")
+                break
+        except Exception as e:
+            if str(e) == "Resource temporarily unavailable":
+                print("Receive timed out, reconnecting...")
+            else:
+                print(e)
+                sys.exit(0)
+
+    timer = Timer()
+    results = []
+    fps_counter = 0
+
+    for i, (frame_id, frame_ts, imgGPU, imgCPU) in enumerate(executor):
+        # for calculating fps over 20 frames
+        if fps_counter % 20 == 0:
+            logger.info('Processing frame {} ({:.2f} fps)'.format(fps_counter, 1. / max(1e-5, timer.average_time)))
+
+        # begin timer and run tracking
+        timer.tic()
+        
+        blob = torch.from_numpy(imgGPU).cuda().unsqueeze(0)
+        online_targets = tracker.update(blob, imgCPU)
+        online_tlwhs = []
+        online_ids = []
+        #online_scores = []
+        
+        # For encoding tracking data
+        obj_vec = []
+        num_tracks = 0
+        builder = flatbuffers.Builder(0)
+        
+        for t in online_targets:
+            tlwh = t.tlwh
+            tid = t.track_id
+            conf = t.score
+            vertical = tlwh[2] / tlwh[3] > 1.6
+            if tlwh[2] * tlwh[3] > opt.min_box_area and not vertical:
+                online_tlwhs.append(tlwh)
+                online_ids.append(tid)
+                #online_scores.append(t.score)
+                
+                # tlwh: (top left x, top left y, width, height)
+                Box.BoxStart(builder)
+                print("Box parameters: ", tlwh)
+                print("Confidence: ", conf)
+                print("Tracking ID: ", tid)
+                # need to convert tlwh elements to ints to pass into Box
+                xCoord, yCoord = int(tlwh[0]), int(tlwh[1])
+                width, height = int(tlwh[2]) + 1, int(tlwh[3]) + 1
+                Box.BoxAddX(builder, xCoord)
+                Box.BoxAddY(builder, yCoord)
+                Box.BoxAddWidth(builder, width)
+                Box.BoxAddHeight(builder, height)
+                box = Box.BoxEnd(builder)
+
+                label = builder.CreateString(str("person"))
+                Detection.DetectionStart(builder)
+                Detection.DetectionAddId(builder, tid)
+                Detection.DetectionAddConf(builder, conf)
+                Detection.DetectionAddLabel(builder, label)
+                Detection.DetectionAddBbox(builder, box)
+
+                obj_vec.append(Detection.DetectionEnd(builder))
+                num_tracks += 1
+        
+        # Build objects vector
+        Detections.DetectionsStartDataVector(builder, num_tracks)
+        for i in range(num_tracks):
+            builder.PrependUOffsetTRelative(obj_vec[i])
+        objects = builder.EndVector(num_tracks)
+
+        timestamp = builder.CreateString(frame_ts)
+        Detections.DetectionsStart(builder)
+        Detections.DetectionsAddId(builder, frame_id)
+        Detections.DetectionsAddTimestamp(builder, timestamp)
+        Detections.DetectionsAddData(builder, objects) #fData)
+        finalBuffer = Detections.DetectionsEnd(builder)
+        builder.Finish(finalBuffer)
+        buf = builder.Output()
+
+        # Send data via outgoing zmq connection
+        while True:
+            try:
+                print("Waiting to receive request from analytics filter")
+                replyData = outStream.recv()
+                reply = bytearray(replyData)
+
+                if reply == b"Request" or reply == b"":
+                    print("Request received, sending streamId...")
+                    outStream.send(streamId, zmq.SNDMORE)
+                    print("Sending tracking data...")
+                    outStream.send(buf)
+                    print("Sent tracking data to port 5558")
+                    break
+                elif reply == b"Connect":
+                    print("Received a connect request, reconnecting")
+                    outStream.send(streamId, zmq.SNDMORE)
+                    outStream.send(b"Accepted")
+                    print("Complete, accepted sent")
+                else:
+                    print(f"Received: {reply}")
+            except Exception as e:
+                if str(e) == "Resource temporarily unavailable":
+                    print("Receive timed out, reconnecting...")
+                else:
+                    print(e)
+                    sys.exit(0)
+
+        timer.toc()
+
+    return fps_counter, timer.average_time, timer.calls
 
 def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_image=True, frame_rate=30):
     if save_dir:
